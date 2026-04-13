@@ -8,11 +8,11 @@
 # the authentication token for the Docker-based installer, and hands off to
 # scripts/install.ps1.
 #
-# Prerequisites:
-#   1. GitHub CLI (gh) installed and authenticated with repo access
-#   2. Docker Desktop installed and running
+# The script walks you through installing any missing prerequisites (gh,
+# Docker Desktop) and authenticating to GitHub. It never crashes with an
+# unhandled exception — every failure produces a clear message and guidance.
 #
-# Usage (run in an elevated PowerShell terminal):
+# Usage (run in a PowerShell terminal):
 #   irm https://raw.githubusercontent.com/Proaxiom-Cyber/rfqbot-install/main/bootstrap.ps1 | iex
 #
 # Or download and run manually:
@@ -38,6 +38,11 @@ function Write-Ok {
     Write-Host "    [ok] $Message" -ForegroundColor Green
 }
 
+function Write-Warn {
+    param([string]$Message)
+    Write-Host "    [warn] $Message" -ForegroundColor Yellow
+}
+
 function Write-Fail {
     param([string]$Message)
     Write-Host "    [error] $Message" -ForegroundColor Red
@@ -47,40 +52,91 @@ function Exit-WithError {
     param([string]$Message)
     Write-Fail $Message
     Write-Host ""
+    Write-Host "    If you need help, contact Proaxiom support." -ForegroundColor DarkGray
+    Write-Host ""
     exit 1
 }
 
+function Wait-ForUser {
+    param([string]$Message)
+    Write-Host ""
+    Read-Host "    $Message — press Enter to continue"
+}
+
+function Confirm-YesNo {
+    param([string]$Prompt, [bool]$DefaultYes = $true)
+    $suffix = if ($DefaultYes) { "[Y/n]" } else { "[y/N]" }
+    $answer = Read-Host "    $Prompt $suffix"
+    if ($DefaultYes) {
+        return -not ($answer -match '^[Nn]')
+    } else {
+        return ($answer -match '^[Yy]')
+    }
+}
+
 # ---------------------------------------------------------------------------
-# Preflight checks
+# Top-level error handler — no stack traces ever reach the user
 # ---------------------------------------------------------------------------
+try {
 
 Write-Host ""
 Write-Host "rfqbot installer bootstrap" -ForegroundColor White
 Write-Host "Proaxiom Cyber" -ForegroundColor DarkGray
 Write-Host ""
 
+# =========================================================================
 # 1. GitHub CLI
+# =========================================================================
 Write-Step "Checking GitHub CLI (gh)..."
+
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-    Write-Host "    GitHub CLI (gh) is not installed." -ForegroundColor Yellow
-    $answer = Read-Host "    Install it now via winget? [Y/n]"
-    if ($answer -match '^[Nn]') {
-        Exit-WithError "gh is required. Install it manually with: winget install GitHub.cli"
+    Write-Warn "GitHub CLI (gh) is not installed."
+
+    # Check if winget is available
+    $hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+
+    if ($hasWinget -and (Confirm-YesNo "Install it now via winget?")) {
+        Write-Host "    Installing GitHub CLI..." -ForegroundColor Cyan
+        try {
+            & winget install GitHub.cli --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+        } catch {
+            Write-Warn "winget install encountered an error: $($_.Exception.Message)"
+        }
+        # Refresh PATH so the current session picks up the new install
+        $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+
+        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            Write-Warn "gh was installed but is not on PATH yet."
+            Wait-ForUser "Close and reopen your terminal, then re-run this script"
+            exit 1
+        }
+        Write-Ok "gh installed successfully"
+    } else {
+        Write-Host ""
+        Write-Host "    Install gh manually:" -ForegroundColor White
+        if ($hasWinget) {
+            Write-Host "        winget install GitHub.cli" -ForegroundColor White
+        }
+        Write-Host "        https://cli.github.com/" -ForegroundColor White
+        Write-Host ""
+        Wait-ForUser "Install gh, then come back here"
+
+        # Re-check after user says they've installed it
+        $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            Exit-WithError "gh is still not on PATH. You may need to close and reopen your terminal."
+        }
+        Write-Ok "gh found"
     }
-    Write-Host "    Installing GitHub CLI..." -ForegroundColor Cyan
-    & winget install GitHub.cli --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
-    # winget installs to a path not in the current session — refresh PATH
-    $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        Exit-WithError "gh was installed but is not on PATH. Close and reopen your terminal, then re-run this script."
-    }
-    Write-Ok "gh installed successfully"
 } else {
     Write-Ok "gh found at $(Get-Command gh | Select-Object -ExpandProperty Source)"
 }
 
-# 2. gh authenticated
+# =========================================================================
+# 2. GitHub authentication
+# =========================================================================
 Write-Step "Checking GitHub authentication..."
+
 $ghAuthed = $false
 try {
     $null = & gh auth status 2>&1
@@ -88,35 +144,71 @@ try {
 } catch {}
 
 if (-not $ghAuthed) {
-    Write-Host "    GitHub CLI is not authenticated. Starting login..." -ForegroundColor Yellow
-    & gh auth login
-    if ($LASTEXITCODE -ne 0) {
-        Exit-WithError "GitHub authentication failed. Run 'gh auth login' manually and try again."
+    Write-Warn "GitHub CLI is not authenticated."
+    Write-Host "    Starting gh auth login — follow the prompts below." -ForegroundColor Cyan
+    Write-Host ""
+    try {
+        & gh auth login
+        if ($LASTEXITCODE -ne 0) { throw "login failed" }
+    } catch {
+        Write-Warn "gh auth login did not complete successfully."
+        Wait-ForUser "Run 'gh auth login' manually in another terminal, then come back"
+
+        # Re-check
+        try {
+            $null = & gh auth status 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "still not authed" }
+        } catch {
+            Exit-WithError "gh is still not authenticated. Run 'gh auth login' and try again."
+        }
     }
 }
 Write-Ok "gh is authenticated"
 
+# =========================================================================
 # 3. Docker
+# =========================================================================
 Write-Step "Checking Docker..."
+
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Host "    Docker Desktop is not installed." -ForegroundColor Yellow
-    $answer = Read-Host "    Install it now via winget? [Y/n]"
-    if ($answer -match '^[Nn]') {
-        Exit-WithError @"
-Docker Desktop is required. Install it from:
-    https://www.docker.com/products/docker-desktop/
-Or: winget install Docker.DockerDesktop
-"@
+    Write-Warn "Docker Desktop is not installed."
+
+    $hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+
+    if ($hasWinget -and (Confirm-YesNo "Install Docker Desktop now via winget?")) {
+        Write-Host "    Installing Docker Desktop (this may take a few minutes)..." -ForegroundColor Cyan
+        try {
+            & winget install Docker.DockerDesktop --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+        } catch {
+            Write-Warn "winget install encountered an error: $($_.Exception.Message)"
+        }
+        $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+
+        if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            Write-Warn "Docker was installed but is not on PATH yet."
+            Write-Host "    You may need to restart your computer for Docker Desktop to finish setup." -ForegroundColor Yellow
+            Wait-ForUser "Restart if needed, start Docker Desktop, then re-run this script"
+            exit 1
+        }
+        Write-Ok "Docker Desktop installed"
+    } else {
+        Write-Host ""
+        Write-Host "    Install Docker Desktop from:" -ForegroundColor White
+        Write-Host "        https://www.docker.com/products/docker-desktop/" -ForegroundColor White
+        if ($hasWinget) {
+            Write-Host "    Or: winget install Docker.DockerDesktop" -ForegroundColor White
+        }
+        Write-Host ""
+        Wait-ForUser "Install Docker Desktop and start it, then come back here"
+
+        $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
+        if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            Exit-WithError "docker is still not on PATH. You may need to restart your computer."
+        }
     }
-    Write-Host "    Installing Docker Desktop (this may take a few minutes)..." -ForegroundColor Cyan
-    & winget install Docker.DockerDesktop --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
-    $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Exit-WithError "Docker was installed but is not on PATH. You may need to restart your computer, then re-run this script."
-    }
-    Write-Ok "Docker Desktop installed"
 }
 
+# Check if Docker daemon is running
 $dockerRunning = $false
 try {
     $null = & docker info 2>&1
@@ -124,20 +216,29 @@ try {
 } catch {}
 
 if (-not $dockerRunning) {
-    Write-Host "    Docker is installed but not running. Attempting to start Docker Desktop..." -ForegroundColor Yellow
-    # Docker Desktop installs to Program Files — find the actual executable.
+    Write-Warn "Docker is installed but the daemon is not running."
+
+    # Try to find and launch Docker Desktop
     $dockerDesktopExe = @(
         "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
         "${env:ProgramFiles(x86)}\Docker\Docker\Docker Desktop.exe"
         "$env:LOCALAPPDATA\Docker\Docker Desktop.exe"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
     if ($dockerDesktopExe) {
-        Start-Process $dockerDesktopExe
+        Write-Host "    Starting Docker Desktop..." -ForegroundColor Cyan
+        try { Start-Process $dockerDesktopExe } catch {
+            Write-Warn "Could not start Docker Desktop automatically."
+        }
     } else {
-        Write-Host "    Could not find Docker Desktop executable. Please start it manually." -ForegroundColor Yellow
+        Write-Host "    Could not find Docker Desktop executable." -ForegroundColor Yellow
     }
-    Write-Host "    Waiting for Docker to start (this can take 30-60 seconds)..." -ForegroundColor Cyan
-    $retries = 30
+
+    Write-Host "    Waiting for Docker daemon to become ready..." -ForegroundColor Cyan
+    Write-Host "    (If Docker Desktop isn't running, please start it now.)" -ForegroundColor Yellow
+
+    $retries = 45  # 90 seconds
+    $dots = 0
     while ($retries -gt 0) {
         Start-Sleep -Seconds 2
         try {
@@ -145,60 +246,98 @@ if (-not $dockerRunning) {
             if ($LASTEXITCODE -eq 0) { $dockerRunning = $true; break }
         } catch {}
         $retries--
+        $dots++
+        if ($dots % 5 -eq 0) {
+            Write-Host "    ... still waiting ($([math]::Round($retries * 2))s remaining)" -ForegroundColor DarkGray
+        }
     }
+
     if (-not $dockerRunning) {
-        Exit-WithError "Docker Desktop did not start in time. Start it manually, then re-run this script."
+        Write-Warn "Docker did not become ready within 90 seconds."
+        Wait-ForUser "Start Docker Desktop manually, wait for it to finish loading, then press Enter"
+
+        try {
+            $null = & docker info 2>&1
+            if ($LASTEXITCODE -eq 0) { $dockerRunning = $true }
+        } catch {}
+
+        if (-not $dockerRunning) {
+            Exit-WithError "Docker daemon is still not running. Start Docker Desktop and re-run this script."
+        }
     }
-    Write-Ok "Docker Desktop is now running"
+    Write-Ok "Docker is now running"
 } else {
     Write-Ok "Docker is running"
 }
 
-# 4. Repo access
+# =========================================================================
+# 4. Repository access
+# =========================================================================
 Write-Step "Checking access to $REPO..."
+
+$repoAccess = $false
 try {
     $null = & gh repo view $REPO --json name 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "no access" }
-} catch {
-    Write-Host "    Cannot access $REPO." -ForegroundColor Yellow
-    Write-Host "    This usually means your GitHub account needs collaborator access." -ForegroundColor Yellow
-    Write-Host "    If you have access but gh lacks the 'repo' scope, run:" -ForegroundColor Yellow
-    Write-Host "        gh auth refresh -s repo" -ForegroundColor White
-    $answer = Read-Host "    Try refreshing gh scopes now? [Y/n]"
-    if ($answer -notmatch '^[Nn]') {
-        & gh auth refresh -s repo
+    if ($LASTEXITCODE -eq 0) { $repoAccess = $true }
+} catch {}
+
+if (-not $repoAccess) {
+    Write-Warn "Cannot access $REPO."
+    Write-Host "    This usually means one of:" -ForegroundColor Yellow
+    Write-Host "      - Your GitHub account hasn't been granted collaborator access" -ForegroundColor Yellow
+    Write-Host "      - Your gh session is missing the 'repo' scope" -ForegroundColor Yellow
+
+    if (Confirm-YesNo "Try refreshing gh with the 'repo' scope?") {
+        try {
+            & gh auth refresh -s repo
+        } catch {
+            Write-Warn "Scope refresh did not complete: $($_.Exception.Message)"
+        }
+
         try {
             $null = & gh repo view $REPO --json name 2>&1
-            if ($LASTEXITCODE -ne 0) { throw "still no access" }
-        } catch {
-            Exit-WithError "Still cannot access $REPO. Contact Proaxiom to confirm your GitHub account has been granted access."
-        }
-    } else {
-        Exit-WithError "Cannot proceed without access to $REPO. Contact Proaxiom to confirm your GitHub account has been granted access."
+            if ($LASTEXITCODE -eq 0) { $repoAccess = $true }
+        } catch {}
+    }
+
+    if (-not $repoAccess) {
+        Exit-WithError "Cannot access $REPO. Contact Proaxiom to confirm your GitHub account has been granted collaborator access."
     }
 }
 Write-Ok "Repository access confirmed"
 
-# ---------------------------------------------------------------------------
-# Download and extract
-# ---------------------------------------------------------------------------
-
+# =========================================================================
+# 5. Download and extract
+# =========================================================================
 Write-Step "Downloading $REPO (main branch)..."
 
 $TempBase = Join-Path $env:TEMP "rfqbot-bootstrap-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-New-Item -ItemType Directory -Path $TempBase -Force | Out-Null
+try {
+    New-Item -ItemType Directory -Path $TempBase -Force | Out-Null
+} catch {
+    Exit-WithError "Could not create temp directory at $TempBase — check disk space and permissions."
+}
 
 $TarballPath = Join-Path $TempBase 'rfqbot.tar.gz'
 
-try {
-    & gh api "repos/$REPO/tarball/main" -o $TarballPath 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "download failed" }
-} catch {
-    Exit-WithError "Failed to download repository tarball. Check your network connection and try again."
+$downloadOk = $false
+for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+        & gh api "repos/$REPO/tarball/main" -o $TarballPath 2>&1
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $TarballPath)) {
+            $downloadOk = $true
+            break
+        }
+    } catch {}
+
+    if ($attempt -lt 3) {
+        Write-Warn "Download attempt $attempt failed. Retrying..."
+        Start-Sleep -Seconds 2
+    }
 }
 
-if (-not (Test-Path $TarballPath)) {
-    Exit-WithError "Tarball was not created at $TarballPath"
+if (-not $downloadOk) {
+    Exit-WithError "Failed to download repository after 3 attempts. Check your network connection and try again."
 }
 Write-Ok "Downloaded to $TarballPath"
 
@@ -208,13 +347,12 @@ New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
 
 try {
     & tar -xzf $TarballPath -C $ExtractDir 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "extraction failed" }
+    if ($LASTEXITCODE -ne 0) { throw "tar failed" }
 } catch {
-    Exit-WithError "Failed to extract tarball. Ensure 'tar' is available (built into Windows 10+)."
+    Exit-WithError "Failed to extract tarball. Ensure 'tar' is available (built into Windows 10 build 17063+)."
 }
 
 # GitHub tarballs extract to a directory named <org>-<repo>-<shortsha>.
-# Find it dynamically.
 $InnerDirs = Get-ChildItem -Path $ExtractDir -Directory
 if ($InnerDirs.Count -ne 1) {
     Exit-WithError "Expected exactly one directory inside the tarball, found $($InnerDirs.Count)."
@@ -225,17 +363,21 @@ Write-Ok "Extracted to $RepoDir"
 # Clean up the tarball — the extracted directory is still needed.
 Remove-Item -Path $TarballPath -Force -ErrorAction SilentlyContinue
 
-# ---------------------------------------------------------------------------
-# Set up token and hand off to install.ps1
-# ---------------------------------------------------------------------------
-
+# =========================================================================
+# 6. Set up token and hand off to install.ps1
+# =========================================================================
 Write-Step "Preparing installer environment..."
 
-$Token = & gh auth token 2>&1
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($Token)) {
-    Exit-WithError "Failed to retrieve GitHub token from 'gh auth token'."
+$Token = $null
+try {
+    $Token = (& gh auth token 2>&1).Trim()
+    if ($LASTEXITCODE -ne 0) { $Token = $null }
+} catch {}
+
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    Exit-WithError "Failed to retrieve GitHub token from 'gh auth token'. Try running 'gh auth login' again."
 }
-$env:RFQBOT_GITHUB_TOKEN = $Token.Trim()
+$env:RFQBOT_GITHUB_TOKEN = $Token
 Write-Ok "RFQBOT_GITHUB_TOKEN set from gh credentials"
 
 $InstallerPath = Join-Path $RepoDir 'scripts' 'install.ps1'
@@ -249,6 +391,29 @@ Write-Host ""
 try {
     Push-Location $RepoDir
     & pwsh -File $InstallerPath -Docker
+} catch {
+    Write-Fail "install.ps1 encountered an error: $($_.Exception.Message)"
+    Write-Host ""
+    Write-Host "    The extracted repo is still at: $RepoDir" -ForegroundColor DarkGray
+    Write-Host "    You can retry manually with:" -ForegroundColor DarkGray
+    Write-Host "        cd `"$RepoDir`"" -ForegroundColor White
+    Write-Host "        `$env:RFQBOT_GITHUB_TOKEN = (gh auth token)" -ForegroundColor White
+    Write-Host "        .\scripts\install.ps1 -Docker" -ForegroundColor White
+    Write-Host ""
+    exit 1
 } finally {
     Pop-Location
+}
+
+# ---------------------------------------------------------------------------
+# End of top-level try block
+# ---------------------------------------------------------------------------
+} catch {
+    Write-Host ""
+    Write-Fail "An unexpected error occurred: $($_.Exception.Message)"
+    Write-Host ""
+    Write-Host "    If this keeps happening, please contact Proaxiom support" -ForegroundColor DarkGray
+    Write-Host "    with the error message above." -ForegroundColor DarkGray
+    Write-Host ""
+    exit 1
 }
