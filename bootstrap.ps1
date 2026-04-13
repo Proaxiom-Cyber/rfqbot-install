@@ -54,6 +54,7 @@ function Exit-WithError {
     Write-Host ""
     Write-Host "    If you need help, contact Proaxiom support." -ForegroundColor DarkGray
     Write-Host ""
+    Read-Host "    Press Enter to close"
     exit 1
 }
 
@@ -321,23 +322,37 @@ try {
 $TarballPath = Join-Path $TempBase 'rfqbot.tar.gz'
 
 $downloadOk = $false
+$lastError = ""
 for ($attempt = 1; $attempt -le 3; $attempt++) {
     try {
-        & gh api "repos/$REPO/tarball/main" -o $TarballPath 2>&1
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $TarballPath)) {
+        $output = & gh api "repos/$REPO/tarball/main" -o $TarballPath 2>&1
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $TarballPath) -and (Get-Item $TarballPath).Length -gt 0) {
             $downloadOk = $true
             break
         }
-    } catch {}
+        $lastError = ($output | Out-String).Trim()
+    } catch {
+        $lastError = $_.Exception.Message
+    }
 
     if ($attempt -lt 3) {
-        Write-Warn "Download attempt $attempt failed. Retrying..."
-        Start-Sleep -Seconds 2
+        Write-Warn "Download attempt $attempt failed. Retrying in 3 seconds..."
+        Start-Sleep -Seconds 3
     }
 }
 
 if (-not $downloadOk) {
-    Exit-WithError "Failed to download repository after 3 attempts. Check your network connection and try again."
+    Write-Fail "Failed to download repository after 3 attempts."
+    if ($lastError) {
+        Write-Host "    Last error: $lastError" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "    This is often caused by missing 'repo' scope on your gh token." -ForegroundColor Yellow
+    Write-Host "    Try: gh auth refresh -s repo" -ForegroundColor White
+    Write-Host "    Then re-run this script." -ForegroundColor Yellow
+    Write-Host ""
+    Read-Host "    Press Enter to close"
+    exit 1
 }
 Write-Ok "Downloaded to $TarballPath"
 
@@ -400,6 +415,7 @@ try {
     Write-Host "        `$env:RFQBOT_GITHUB_TOKEN = (gh auth token)" -ForegroundColor White
     Write-Host "        .\scripts\install.ps1 -Docker" -ForegroundColor White
     Write-Host ""
+    Read-Host "    Press Enter to close"
     exit 1
 } finally {
     Pop-Location
@@ -415,5 +431,6 @@ try {
     Write-Host "    If this keeps happening, please contact Proaxiom support" -ForegroundColor DarkGray
     Write-Host "    with the error message above." -ForegroundColor DarkGray
     Write-Host ""
+    Read-Host "    Press Enter to close"
     exit 1
 }
