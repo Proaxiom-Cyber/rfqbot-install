@@ -134,21 +134,14 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 }
 
 # =========================================================================
-# 2. GitHub authentication (with repo scope for private repo access)
+# 2. GitHub authentication + private repo access (combined check)
 # =========================================================================
 Write-Step "Checking GitHub authentication..."
 
 $ghAuthed = $false
-$hasRepoScope = $false
 try {
-    $statusOutput = & gh auth status 2>&1 | Out-String
-    if ($LASTEXITCODE -eq 0) {
-        $ghAuthed = $true
-        # Check if the token has the 'repo' scope needed for private repo access
-        if ($statusOutput -match "'repo'") {
-            $hasRepoScope = $true
-        }
-    }
+    $null = & gh auth status 2>&1
+    if ($LASTEXITCODE -eq 0) { $ghAuthed = $true }
 } catch {}
 
 if (-not $ghAuthed) {
@@ -159,12 +152,9 @@ if (-not $ghAuthed) {
         & gh auth login -s repo
         if ($LASTEXITCODE -ne 0) { throw "login failed" }
         $ghAuthed = $true
-        $hasRepoScope = $true
     } catch {
         Write-Warn "gh auth login did not complete successfully."
         Wait-ForUser "Run 'gh auth login -s repo' manually in another terminal, then come back"
-
-        # Re-check
         try {
             $null = & gh auth status 2>&1
             if ($LASTEXITCODE -ne 0) { throw "still not authed" }
@@ -174,19 +164,48 @@ if (-not $ghAuthed) {
         }
     }
 }
+Write-Ok "gh is authenticated"
 
-# If already authenticated but missing repo scope, refresh
-if ($ghAuthed -and -not $hasRepoScope) {
-    Write-Warn "gh is authenticated but may be missing the 'repo' scope needed for private repo access."
-    Write-Host "    Refreshing token with repo scope..." -ForegroundColor Cyan
+# Verify we can actually access the private repo — this catches missing
+# 'repo' scope on existing tokens. If it fails, auto-refresh with the
+# scope and re-check.
+Write-Step "Checking access to $REPO..."
+
+$repoAccess = $false
+try {
+    $null = & gh repo view $REPO --json name 2>&1
+    if ($LASTEXITCODE -eq 0) { $repoAccess = $true }
+} catch {}
+
+if (-not $repoAccess) {
+    Write-Warn "Cannot access $REPO — refreshing token with 'repo' scope..."
     try {
         & gh auth refresh -s repo
         if ($LASTEXITCODE -ne 0) { throw "refresh failed" }
     } catch {
-        Write-Warn "Scope refresh did not complete. If the download fails, run: gh auth refresh -s repo"
+        Write-Warn "Automatic scope refresh failed: $($_.Exception.Message)"
+    }
+
+    # Re-check after refresh
+    try {
+        $null = & gh repo view $REPO --json name 2>&1
+        if ($LASTEXITCODE -eq 0) { $repoAccess = $true }
+    } catch {}
+
+    if (-not $repoAccess) {
+        Write-Fail "Still cannot access $REPO."
+        Write-Host ""
+        Write-Host "    This usually means one of:" -ForegroundColor Yellow
+        Write-Host "      - Your GitHub account hasn't been granted collaborator access" -ForegroundColor Yellow
+        Write-Host "      - The scope refresh didn't complete (try manually: gh auth refresh -s repo)" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "    Contact Proaxiom to confirm your account has access." -ForegroundColor Yellow
+        Write-Host ""
+        Read-Host "    Press Enter to close"
+        exit 1
     }
 }
-Write-Ok "gh is authenticated with repo access"
+Write-Ok "Repository access confirmed"
 
 # =========================================================================
 # 3. Docker
@@ -294,43 +313,7 @@ if (-not $dockerRunning) {
 }
 
 # =========================================================================
-# 4. Repository access
-# =========================================================================
-Write-Step "Checking access to $REPO..."
-
-$repoAccess = $false
-try {
-    $null = & gh repo view $REPO --json name 2>&1
-    if ($LASTEXITCODE -eq 0) { $repoAccess = $true }
-} catch {}
-
-if (-not $repoAccess) {
-    Write-Warn "Cannot access $REPO."
-    Write-Host "    This usually means one of:" -ForegroundColor Yellow
-    Write-Host "      - Your GitHub account hasn't been granted collaborator access" -ForegroundColor Yellow
-    Write-Host "      - Your gh session is missing the 'repo' scope" -ForegroundColor Yellow
-
-    if (Confirm-YesNo "Try refreshing gh with the 'repo' scope?") {
-        try {
-            & gh auth refresh -s repo
-        } catch {
-            Write-Warn "Scope refresh did not complete: $($_.Exception.Message)"
-        }
-
-        try {
-            $null = & gh repo view $REPO --json name 2>&1
-            if ($LASTEXITCODE -eq 0) { $repoAccess = $true }
-        } catch {}
-    }
-
-    if (-not $repoAccess) {
-        Exit-WithError "Cannot access $REPO. Contact Proaxiom to confirm your GitHub account has been granted collaborator access."
-    }
-}
-Write-Ok "Repository access confirmed"
-
-# =========================================================================
-# 5. Download and extract
+# 4. Download and extract
 # =========================================================================
 Write-Step "Downloading $REPO (main branch)..."
 
@@ -343,16 +326,30 @@ try {
 
 $TarballPath = Join-Path $TempBase 'rfqbot.tar.gz'
 
+# Get the token from gh and use Invoke-WebRequest for the download.
+# This avoids the gh api -o flag which doesn't exist in older gh versions.
+$Token = $null
+try {
+    $Token = (& gh auth token 2>&1).Trim()
+    if ($LASTEXITCODE -ne 0) { $Token = $null }
+} catch {}
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    Exit-WithError "Failed to retrieve GitHub token from 'gh auth token'."
+}
+
 $downloadOk = $false
 $lastError = ""
+$headers = @{ Authorization = "Bearer $Token"; Accept = "application/vnd.github+json" }
+
 for ($attempt = 1; $attempt -le 3; $attempt++) {
     try {
-        $output = & gh api "repos/$REPO/tarball/main" -o $TarballPath 2>&1
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $TarballPath) -and (Get-Item $TarballPath).Length -gt 0) {
+        Invoke-WebRequest -Uri "https://api.github.com/repos/$REPO/tarball/main" `
+            -Headers $headers -OutFile $TarballPath -UseBasicParsing
+        if ((Test-Path $TarballPath) -and (Get-Item $TarballPath).Length -gt 0) {
             $downloadOk = $true
             break
         }
-        $lastError = ($output | Out-String).Trim()
+        $lastError = "Download produced an empty file."
     } catch {
         $lastError = $_.Exception.Message
     }
@@ -368,10 +365,6 @@ if (-not $downloadOk) {
     if ($lastError) {
         Write-Host "    Last error: $lastError" -ForegroundColor Yellow
     }
-    Write-Host ""
-    Write-Host "    This is often caused by missing 'repo' scope on your gh token." -ForegroundColor Yellow
-    Write-Host "    Try: gh auth refresh -s repo" -ForegroundColor White
-    Write-Host "    Then re-run this script." -ForegroundColor Yellow
     Write-Host ""
     Read-Host "    Press Enter to close"
     exit 1
@@ -405,15 +398,7 @@ Remove-Item -Path $TarballPath -Force -ErrorAction SilentlyContinue
 # =========================================================================
 Write-Step "Preparing installer environment..."
 
-$Token = $null
-try {
-    $Token = (& gh auth token 2>&1).Trim()
-    if ($LASTEXITCODE -ne 0) { $Token = $null }
-} catch {}
-
-if ([string]::IsNullOrWhiteSpace($Token)) {
-    Exit-WithError "Failed to retrieve GitHub token from 'gh auth token'. Try running 'gh auth login' again."
-}
+# $Token was already retrieved in the download step above.
 $env:RFQBOT_GITHUB_TOKEN = $Token
 Write-Ok "RFQBOT_GITHUB_TOKEN set from gh credentials"
 
