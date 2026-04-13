@@ -125,7 +125,17 @@ try {
 
 if (-not $dockerRunning) {
     Write-Host "    Docker is installed but not running. Attempting to start Docker Desktop..." -ForegroundColor Yellow
-    Start-Process "Docker Desktop" -ErrorAction SilentlyContinue
+    # Docker Desktop installs to Program Files — find the actual executable.
+    $dockerDesktopExe = @(
+        "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
+        "${env:ProgramFiles(x86)}\Docker\Docker\Docker Desktop.exe"
+        "$env:LOCALAPPDATA\Docker\Docker Desktop.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($dockerDesktopExe) {
+        Start-Process $dockerDesktopExe
+    } else {
+        Write-Host "    Could not find Docker Desktop executable. Please start it manually." -ForegroundColor Yellow
+    }
     Write-Host "    Waiting for Docker to start (this can take 30-60 seconds)..." -ForegroundColor Cyan
     $retries = 30
     while ($retries -gt 0) {
