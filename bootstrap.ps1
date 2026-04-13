@@ -134,37 +134,59 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
 }
 
 # =========================================================================
-# 2. GitHub authentication
+# 2. GitHub authentication (with repo scope for private repo access)
 # =========================================================================
 Write-Step "Checking GitHub authentication..."
 
 $ghAuthed = $false
+$hasRepoScope = $false
 try {
-    $null = & gh auth status 2>&1
-    if ($LASTEXITCODE -eq 0) { $ghAuthed = $true }
+    $statusOutput = & gh auth status 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+        $ghAuthed = $true
+        # Check if the token has the 'repo' scope needed for private repo access
+        if ($statusOutput -match "'repo'") {
+            $hasRepoScope = $true
+        }
+    }
 } catch {}
 
 if (-not $ghAuthed) {
     Write-Warn "GitHub CLI is not authenticated."
-    Write-Host "    Starting gh auth login — follow the prompts below." -ForegroundColor Cyan
+    Write-Host "    Starting gh auth login with private repo access..." -ForegroundColor Cyan
     Write-Host ""
     try {
-        & gh auth login
+        & gh auth login -s repo
         if ($LASTEXITCODE -ne 0) { throw "login failed" }
+        $ghAuthed = $true
+        $hasRepoScope = $true
     } catch {
         Write-Warn "gh auth login did not complete successfully."
-        Wait-ForUser "Run 'gh auth login' manually in another terminal, then come back"
+        Wait-ForUser "Run 'gh auth login -s repo' manually in another terminal, then come back"
 
         # Re-check
         try {
             $null = & gh auth status 2>&1
             if ($LASTEXITCODE -ne 0) { throw "still not authed" }
+            $ghAuthed = $true
         } catch {
-            Exit-WithError "gh is still not authenticated. Run 'gh auth login' and try again."
+            Exit-WithError "gh is still not authenticated. Run 'gh auth login -s repo' and try again."
         }
     }
 }
-Write-Ok "gh is authenticated"
+
+# If already authenticated but missing repo scope, refresh
+if ($ghAuthed -and -not $hasRepoScope) {
+    Write-Warn "gh is authenticated but may be missing the 'repo' scope needed for private repo access."
+    Write-Host "    Refreshing token with repo scope..." -ForegroundColor Cyan
+    try {
+        & gh auth refresh -s repo
+        if ($LASTEXITCODE -ne 0) { throw "refresh failed" }
+    } catch {
+        Write-Warn "Scope refresh did not complete. If the download fails, run: gh auth refresh -s repo"
+    }
+}
+Write-Ok "gh is authenticated with repo access"
 
 # =========================================================================
 # 3. Docker
