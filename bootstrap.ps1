@@ -383,7 +383,9 @@ try {
 }
 
 # GitHub tarballs extract to a directory named <org>-<repo>-<shortsha>.
-$InnerDirs = Get-ChildItem -Path $ExtractDir -Directory
+# Force to array — a single result from Get-ChildItem is a scalar in
+# Windows PowerShell 5.1 and .Count doesn't exist on it.
+$InnerDirs = @(Get-ChildItem -Path $ExtractDir -Directory)
 if ($InnerDirs.Count -ne 1) {
     Exit-WithError "Expected exactly one directory inside the tarball, found $($InnerDirs.Count)."
 }
